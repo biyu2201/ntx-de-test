@@ -5,6 +5,8 @@ from tqdm import tqdm
 import polars as pl
 import json
 
+base_url = "https://www.fortiguard.com/encyclopedia?type=ips&risk={level}&page={page}"
+
 #Fungsi untuk memanggil url dan mengambil table-body untuk discrape
 async def fetch_web(client, url: str) -> object:
     #Membuat error handling untuk timeout dan http error
@@ -33,22 +35,21 @@ async def scrape(scraped_page: object) -> tuple[list[str], list[str]]:
     #Mengembalikan daftar link dan judul artikel   
     return list_of_links, list_of_titles
 
-#Fungsi untuk mengambil data dari semua halaman pada satu level
-async def scrape_pages(pages: int, level: int, client) -> tuple[list[object], list[int]]:
+#Fungsi untuk iterasi semua halaman pada satu level
+async def iterate_pages(pages: int, level: int) -> tuple[object, list[int]]:
     tasks = []
     skipped_pages_per_level = []
-    link_list = []
-    title_list = []
 
     #For loop untuk iterasi semua halaman pada sebuah level
     for page in tqdm(range(1, pages + 1), desc=f"Level {level}"):
-            url = f"https://www.fortiguard.com/encyclopedia?type=ips&risk={level}&page={page}"
+            url = base_url.format(level=level, page=page)
             try:
                 #Memanggil fungsi fetch_web
-                scraped_page = await fetch_web(client, url)
-                if scraped_page == None:
-                    skipped_pages_per_level.append(page)
-                    continue
+                async with httpx.AsyncClient() as client:
+                    scraped_page = await fetch_web(client, url)
+                    if scraped_page == None:
+                        skipped_pages_per_level.append(page)
+                        continue
             #jika terjadi timeout maka page tersbut akan dimasukkan ke daftar page yang diskip
             except TimeoutError as e:
                 skipped_pages_per_level.append(page)
@@ -59,9 +60,18 @@ async def scrape_pages(pages: int, level: int, client) -> tuple[list[object], li
                 continue
             #Memasukkan task scrape untuk tiap-tiap halaman agar bisa dijalankan secara bersamaan
             tasks.append(scrape(scraped_page))
+    
+    return tasks, skipped_pages_per_level
+
+#Fungsi untuk menyimpan data ke csv
+async def write_to_csv(pages: int, level: int) -> list[int]:
+    link_list = []
+    title_list = []
+
+    page_task, skipped_pages_per_level = await iterate_pages(pages, level)
 
     #Menjalankan task scrape dari semua halaman dan menyimpan hasilnya di results
-    results = await asyncio.gather(*tasks)
+    results = await asyncio.gather(*page_task)
 
     for result in results:
         list_of_links, list_of_titles = result
@@ -70,8 +80,8 @@ async def scrape_pages(pages: int, level: int, client) -> tuple[list[object], li
 
     #Memasukan daftar link dan title yang sudah discrape ke dalam dictionary kemudian dimasukan ke dataframe
     data = {
-        'title': link_list,
-        'link': title_list
+        'title': title_list,
+        'link': link_list
     }
     df = pl.DataFrame(data)
 
@@ -81,8 +91,7 @@ async def scrape_pages(pages: int, level: int, client) -> tuple[list[object], li
     #Mengembalikan variabel berisi list dari halaman yang diskip
     return skipped_pages_per_level
 
-#Fungsi untuk mengumpulkan data dari tiap level dan mengubah data tersebut menjadi csv
-async def scrape_level(levels: list[int], pages: list[int], client: httpx.AsyncClient) -> None:
+async def main(levels: list[int], pages: list[int]) -> None:
     skip_page_dict = {}
     tasks = []
     count = 1
@@ -91,7 +100,7 @@ async def scrape_level(levels: list[int], pages: list[int], client: httpx.AsyncC
     for index in range(len(levels)):
 
         #Menambahkan task scrape_Pages untuk tiap level agar bisa dijalankan secara bersamaan
-        tasks.append(scrape_pages(pages[index], levels[index], client))
+        tasks.append(write_to_csv(pages[index], levels[index]))
 
     #Menjalankan scraping untuk tiap level secara bersamaan
     results = await asyncio.gather(*tasks)
@@ -105,10 +114,6 @@ async def scrape_level(levels: list[int], pages: list[int], client: httpx.AsyncC
     #Membuat file skipped.json untuk page yang diskip
     with open("datasets/skipped.json", "w") as outfile:
         json.dump(skip_page_dict, outfile)
-
-async def main(levels, pages):
-    async with httpx.AsyncClient() as client:
-        await scrape_level(levels=levels, pages=pages, client=client)
 
 if __name__ == "__main__":
     levels = [1, 2, 3, 4, 5]
